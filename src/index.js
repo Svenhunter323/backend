@@ -21,8 +21,8 @@ const server = http.createServer(app);
 // Middleware
 // app.use(cors());
 // app.use(express.json());
-
 // Init DB & Socket.io
+
 connectDB();
 initSocket(server);
 initWeb3Listeners();

@@ -4,19 +4,23 @@ const app = express();
 const adminrouter = require("./admin");
 const io = require("../socket/index").io;
 const betsRoute = require("./bets")(io);
+const avatarRouter = require("./avatar");
+const path = require("path");
+const fs = require("fs");
 
 app.use(cors());
 app.use(express.json());
 
-// Sample endpoint
-app.get("/api/leaderboard", (req, res) => {
-  res.json([
-    { user: "0x123...", wins: 12 },
-    { user: "0xabc...", wins: 9 }
-  ]);
-});
 
-// app.listen(PORT, () => console.log(`API listening on port ${PORT}`));
+// Ensure avatar directory exists
+const AVATAR_DIR = path.join(process.cwd(), "uploads", "avatars");
+if (!fs.existsSync(AVATAR_DIR)) fs.mkdirSync(AVATAR_DIR, { recursive: true });
+
+// Serve uploaded avatars statically
+app.use("/avatars", express.static(AVATAR_DIR));
+
 app.use("/api/admin", adminrouter);
 app.use("/api/bets", betsRoute);
+app.use("/api/avatar", avatarRouter);
+
 module.exports = app;

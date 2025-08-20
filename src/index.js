@@ -1,15 +1,11 @@
 require("dotenv").config();
 // const express = require("express");
-const http = require("http");
-const cors = require("cors");
 const connectDB = require("./db");
-const initSocket = require("./socket");
+// const initSocket = require("./socket");
 // const AdminUser = require("./models/AdminUser");
 // const app = express();
-const app = require("./api");
+const server = require("./api");
 const initWeb3Listeners = require("./web3");
-
-const server = http.createServer(app);
 
 // AdminUser.create({
 //     username: "admin",
@@ -18,13 +14,7 @@ const server = http.createServer(app);
 //     if (err.code !== 11000) console.error("❌ Admin user creation error:", err);
 // })
 
-// Middleware
-// app.use(cors());
-// app.use(express.json());
-// Init DB & Socket.io
-
 connectDB();
-initSocket(server);
 initWeb3Listeners();
 
 // Start server

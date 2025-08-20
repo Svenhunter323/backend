@@ -9,19 +9,79 @@ const User = require("../models/User");
 const Bet = require("../models/Bet");
 const UserHistory = require("../models/UserHistory");
 const Leaderboard = require("../models/Leaderboard");
-const { broadcastLeaderboardUpdate, broadcastLiveHistory } = require("../socket")();
+
+const {
+  broadcastLeaderboardUpdate,
+  broadcastLiveHistory,
+  broadcastBetPlaced,
+} = require("../socket");
+
+// Live analytics hooks (debounced)
+const { scheduleRecomputeAndBroadcast, onNewHistoryRow } = require("../lib/analytics");
 
 const DECIMALS = Number(process.env.TOKEN_DECIMALS || 18);
 
-function normalizeAddr(a) {
-  return String(a || "").toLowerCase();
+/* ------------------------- tiny utils (robust) ------------------------- */
+
+const normalizeAddr = (a) => String(a || "").toLowerCase();
+
+const toStrBig = (v) => {
+  try {
+    if (typeof v === "bigint") return v.toString();
+    if (typeof v === "number") return Number.isFinite(v) ? String(v) : "0";
+    if (typeof v === "string") return v;
+    if (v && typeof v.toString === "function") return v.toString();
+    return "0";
+  } catch {
+    return "0";
+  }
+};
+
+const toReadable = (v) => {
+  try {
+    if (typeof v === "bigint") return formatUnits(v, DECIMALS);
+    const s = toStrBig(v);
+    return formatUnits(BigInt(s), DECIMALS);
+  } catch {
+    return "0";
+  }
+};
+
+// Always return a finite Number for $inc (fallback to 0)
+function toIncNumber(v) {
+  try {
+    if (v === null || v === undefined) return 0;
+    if (typeof v === "number") return Number.isFinite(v) ? v : 0;
+    if (typeof v === "bigint") {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : 0;
+    }
+    const s = toStrBig(v);
+    const n = Number(s);
+    return Number.isFinite(n) ? n : 0;
+  } catch {
+    return 0;
+  }
 }
-function toStrBig(v) {
-  return typeof v === "bigint" ? v.toString() : String(v);
+
+// Convert to plain Number for UI broadcast (non-fatal if not finite)
+function toNumberOr0(v) {
+  try {
+    const s = toStrBig(v);
+    const n = Number(s);
+    return Number.isFinite(n) ? n : 0;
+  } catch {
+    return 0;
+  }
 }
-function toReadable(v) {
-  return formatUnits(v, DECIMALS);
-}
+
+// timestamp to ms if needed
+const tsMs = (t) => {
+  const n = Number(t || 0);
+  return n < 1e12 ? n * 1000 : n;
+};
+
+/* ---------------------------------------------------------------------- */
 
 function initWeb3Listeners() {
   const url = process.env.WS_RPC_URL;
@@ -33,8 +93,35 @@ function initWeb3Listeners() {
     const wavePool = new ethers.Contract(process.env.WAVE_POOL_ADDR, wavePoolAbi, provider);
     const waveChallenge = new ethers.Contract(process.env.WAVE_CHALLENGE_ADDR, waveChallengeAbi, provider);
 
-    // -------------- Shared helpers --------------
+    // Emit a row that matches the Bets admin page
+    async function emitBetRow({ address, gameType, xpAmount, reward, result, timestamp }) {
+      const wallet = normalizeAddr(address);
+      const user = await User.findOne({ wallet }, { username: 1 }).lean();
+
+      const amountNum = toNumberOr0(xpAmount);
+      const payoutNum = toNumberOr0(reward);
+      const resultStr = (result === true) ? "win" : (result === false) ? "loss" : "pending";
+
+      broadcastBetPlaced({
+        username: user?.username || wallet,
+        gameType,
+        amount: amountNum,
+        result: resultStr,
+        payout: payoutNum || undefined,
+        timestamp: tsMs(timestamp),
+        multiplier: (amountNum > 0 && payoutNum > 0)
+          ? Number((payoutNum / amountNum).toFixed(2))
+          : null,
+      });
+    }
+
+    // Safe winner handler (no NaN increments)
     async function handleWinner({ gameType, winner, reward, xpAmount, timestamp }) {
+      // ensure defined
+      const incReward = toIncNumber(reward);
+      const incXP = toIncNumber(xpAmount);
+
+      // persist history (stringify bigs)
       await UserHistory.create({
         address: winner,
         gameType,
@@ -44,18 +131,22 @@ function initWeb3Listeners() {
         timestamp: Number(timestamp),
       });
 
-      // If your totals may overflow JS Number, switch to Decimal128 in schema.
-      await Leaderboard.findOneAndUpdate(
-        { address: winner },
-        {
-          $inc: {
-            wins: 1,
-            totalReward: Number(toStrBig(reward)),
-            totalXP: Number(toStrBig(xpAmount)),
+      // leaderboard increments (never NaN)
+      try {
+        await Leaderboard.findOneAndUpdate(
+          { address: winner },
+          {
+            $inc: {
+              wins: 1,
+              totalReward: incReward,
+              totalXP: incXP,
+            },
           },
-        },
-        { upsert: true }
-      );
+          { upsert: true }
+        );
+      } catch (e) {
+        console.error("❌ Leaderboard increment failed (guarded):", e?.message || e);
+      }
 
       await broadcastLeaderboardUpdate();
       await broadcastLiveHistory({
@@ -65,6 +156,19 @@ function initWeb3Listeners() {
         xpAmount: toStrBig(xpAmount),
         timestamp: Number(timestamp),
       });
+
+      // also emit a settled row to Bets feed
+      await emitBetRow({
+        address: winner,
+        gameType,
+        xpAmount: toStrBig(xpAmount),
+        reward: toStrBig(reward),
+        result: true,
+        timestamp,
+      });
+
+      // analytics recompute (debounced)
+      onNewHistoryRow();
     }
 
     async function getBlockTimestampFromTx(txHash) {
@@ -73,22 +177,21 @@ function initWeb3Listeners() {
       return Number(block.timestamp);
     }
 
-    // -------------- WAVE CHALLENGE (existing) --------------
+    /* ======================= WAVE CHALLENGE ======================= */
+
     waveChallenge.on("ChallengeCreated", async (challengeId, creator, xpAmount, event) => {
       try {
         const creatorAddr = normalizeAddr(creator);
-
-        const user = await User.findOneAndUpdate(
+        await User.findOneAndUpdate(
           { wallet: creatorAddr },
           { username: creatorAddr, wallet: creatorAddr },
           { upsert: true, new: true }
         );
 
-        // Idempotent per role
         const existing = await Bet.findOne({ challengeId: String(challengeId), role: "creator" });
         if (!existing) {
-          const bet = await Bet.create({
-            userId: user._id,
+          await Bet.create({
+            userId: (await User.findOne({ wallet: creatorAddr }))._id,
             username: creatorAddr,
             gameType: "challenge",
             amount: toStrBig(xpAmount),
@@ -98,8 +201,20 @@ function initWeb3Listeners() {
             role: "creator",
             challengeId: String(challengeId),
           });
-          broadcastLiveHistory({ type: "new_bet", data: bet });
         }
+
+        const rcpt = await provider.getTransactionReceipt(event.log.transactionHash);
+        const block = await provider.getBlock(rcpt.blockNumber);
+        await emitBetRow({
+          address: creatorAddr,
+          gameType: "challenge",
+          xpAmount: toStrBig(xpAmount),
+          reward: "0",
+          result: null,
+          timestamp: block.timestamp,
+        });
+
+        scheduleRecomputeAndBroadcast();
       } catch (err) {
         console.error("❌ ChallengeCreated error:", err);
       }
@@ -108,8 +223,7 @@ function initWeb3Listeners() {
     waveChallenge.on("EnteredChallenge", async (challengeId, userAddr, xpAmount, event) => {
       try {
         const addr = normalizeAddr(userAddr);
-
-        const user = await User.findOneAndUpdate(
+        await User.findOneAndUpdate(
           { wallet: addr },
           { username: addr, wallet: addr },
           { upsert: true, new: true }
@@ -117,8 +231,8 @@ function initWeb3Listeners() {
 
         const existing = await Bet.findOne({ challengeId: String(challengeId), role: "challenger" });
         if (!existing) {
-          const bet = await Bet.create({
-            userId: user._id,
+          await Bet.create({
+            userId: (await User.findOne({ wallet: addr }))._id,
             username: addr,
             gameType: "challenge",
             amount: toStrBig(xpAmount),
@@ -128,8 +242,20 @@ function initWeb3Listeners() {
             role: "challenger",
             challengeId: String(challengeId),
           });
-          broadcastLiveHistory({ type: "new_bet", data: bet });
         }
+
+        const rcpt = await provider.getTransactionReceipt(event.log.transactionHash);
+        const block = await provider.getBlock(rcpt.blockNumber);
+        await emitBetRow({
+          address: addr,
+          gameType: "challenge",
+          xpAmount: toStrBig(xpAmount),
+          reward: "0",
+          result: null,
+          timestamp: block.timestamp,
+        });
+
+        scheduleRecomputeAndBroadcast();
       } catch (err) {
         console.error("❌ EnteredChallenge error:", err);
       }
@@ -137,7 +263,7 @@ function initWeb3Listeners() {
 
     waveChallenge.on(
       "WinnerDrawn",
-      async (challengeId, p1, p2, wager, resultFromEvent, winner, time, reward, event) => {
+      async (challengeId, p1, p2, wager, _resultFromEvent, winner, time, reward, _event) => {
         try {
           const challengeIdStr = String(challengeId);
           const winnerAddr = normalizeAddr(winner);
@@ -149,24 +275,26 @@ function initWeb3Listeners() {
           );
 
           const bets = await Bet.find({ challengeId: challengeIdStr });
-          if (!bets.length) {
-            console.warn(`⚠️ No bets found for challengeId: ${challengeIdStr}`);
-          } else {
-            for (const bet of bets) {
-              const isWinner = normalizeAddr(bet.username) === winnerAddr;
-              bet.result = isWinner;
-              bet.payout = isWinner ? toStrBig(reward) : "0";
-              await bet.save();
-            }
+          if (bets.length) {
+            await Promise.all(
+              bets.map(async (bet) => {
+                const isWinner = normalizeAddr(bet.username) === winnerAddr;
+                bet.result = isWinner;
+                bet.payout = isWinner ? toStrBig(reward) : "0";
+                await bet.save();
+              })
+            );
           }
 
-          // Use on-chain "time" for this event (already emitted)
+          // ensure xpAmount defaults to 0n if somehow undefined
           await handleWinner({
             gameType: "challenge",
             winner: winnerAddr,
             reward,
-            xpAmount: wager,
-            timestamp: time,
+            xpAmount: (typeof wager === "bigint" || typeof wager === "number" || typeof wager === "string")
+              ? wager
+              : 0n,
+            timestamp: time, // on-chain timestamp
           });
 
           console.log(`✅ Challenge WinnerDrawn handled: ${winnerAddr}`);
@@ -176,12 +304,10 @@ function initWeb3Listeners() {
       }
     );
 
-    // -------------- WAVE POOL (new) --------------
+    /* ========================= WAVE POOL ========================= */
 
-    // PoolCreated(bytes32 poolId, address baseToken, uint256 limitAmount, uint256 ticketPrice, bool poolType)
     wavePool.on("PoolCreated", async (poolId, baseToken, limitAmount, ticketPrice, poolType) => {
       try {
-        // Optional: broadcast to UI (no DB change needed)
         await broadcastLiveHistory({
           type: "pool_created",
           data: {
@@ -192,25 +318,24 @@ function initWeb3Listeners() {
             poolType: !!poolType,
           },
         });
+        scheduleRecomputeAndBroadcast();
       } catch (err) {
         console.error("❌ PoolCreated error:", err);
       }
     });
 
-    // EnteredPool(bytes32 poolId, address user, uint256 xpAmount)
     wavePool.on("EnteredPool", async (poolId, userAddr, xpAmount, event) => {
       const poolIdStr = String(poolId);
       const addr = normalizeAddr(userAddr);
       try {
-        const user = await User.findOneAndUpdate(
+        await User.findOneAndUpdate(
           { wallet: addr },
           { username: addr, wallet: addr },
           { upsert: true, new: true }
         );
 
-        // Multiple entries allowed → one Bet per entry.
-        const bet = await Bet.create({
-          userId: user._id,
+        await Bet.create({
+          userId: (await User.findOne({ wallet: addr }))._id,
           username: addr,
           gameType: "pool",
           amount: toStrBig(xpAmount),
@@ -218,18 +343,27 @@ function initWeb3Listeners() {
           payout: "0",
           txHash: event?.log?.transactionHash || null,
           role: "entrant",
-          // Reuse existing field: store poolId here
           challengeId: poolIdStr,
         });
 
-        broadcastLiveHistory({ type: "new_bet", data: bet });
+        const rcpt = await provider.getTransactionReceipt(event.log.transactionHash);
+        const block = await provider.getBlock(rcpt.blockNumber);
+        await emitBetRow({
+          address: addr,
+          gameType: "pool",
+          xpAmount: toStrBig(xpAmount),
+          reward: "0",
+          result: null,
+          timestamp: block.timestamp,
+        });
+
+        scheduleRecomputeAndBroadcast();
       } catch (err) {
         console.error("❌ EnteredPool error:", err);
       }
     });
 
-    // WinnerDrawn(bytes32 poolId, address winner, uint256 rewardAmount)
-    wavePool.on("WinnerDrawn", async (poolId, winnerAddr, rewardAmount, event) => {
+    wavePool.on("WinnerDrawn", async (poolId, winnerAddr, rewardAmount, poolType, event) => {
       const poolIdStr = String(poolId);
       const winner = normalizeAddr(winnerAddr);
       try {
@@ -239,7 +373,7 @@ function initWeb3Listeners() {
           { upsert: true, new: true }
         );
 
-        // 1) Mark all entries in the pool as lost by default
+        // pessimistic: mark all as lost; (optional) later match exact winning entry
         const bets = await Bet.find({ challengeId: poolIdStr });
         for (const bet of bets) {
           bet.result = false;
@@ -247,68 +381,13 @@ function initWeb3Listeners() {
         }
         await Promise.all(bets.map((b) => b.save()));
 
-        // 2) Resolve the single winning entry among winner's bets
-        //    Use on-chain state to get winner snapshot (xpAmount, betTime)
-        let winnerSnap;
-        try {
-          const res = await wavePool.getPoolState(poolId); // returns (totalXpAmount, users[], winner)
-          // Ethers v6 returns both array indices and named props; prefer index access for safety.
-          winnerSnap = res[2]; // winner
-        } catch (e) {
-          console.warn("⚠️ getPoolState failed, falling back to best-effort matching");
-        }
-
-        const winnerBets = await Bet.find({ challengeId: poolIdStr, username: winner });
-        let chosen = null;
-
-        if (winnerSnap) {
-          const targetAmount = toStrBig(winnerSnap.rewardAmount) // not entry; rewardAmount!
-          // We actually need the entry xpAmount & betTime from winnerSnap:
-          const entryXpAmount = toStrBig(winnerSnap.xpAmount);
-          const entryBetTime = Number(winnerSnap.betTime);
-
-          // Match by (amount == entryXpAmount) and nearest tx timestamp to entryBetTime
-          let bestDiff = Number.POSITIVE_INFINITY;
-          for (const b of winnerBets) {
-            if (toStrBig(b.amount) !== entryXpAmount) continue;
-            if (!b.txHash) continue;
-            try {
-              const ts = await getBlockTimestampFromTx(b.txHash);
-              const diff = Math.abs(ts - entryBetTime);
-              if (diff < bestDiff) {
-                bestDiff = diff;
-                chosen = b;
-              }
-            } catch {
-              // ignore and continue
-            }
-          }
-        }
-
-        // If not found (fallback): pick the most recent winner bet
-        if (!chosen && winnerBets.length) {
-          chosen = winnerBets[winnerBets.length - 1];
-        }
-
-        if (chosen) {
-          chosen.result = true;
-          chosen.payout = toStrBig(rewardAmount);
-          await chosen.save();
-        } else {
-          console.warn(`⚠️ No matching winner Bet found for poolId=${poolIdStr}, winner=${winner}; (DB still updated via history/leaderboard)`);
-        }
-
-        // 3) Broadcast + history/leaderboard
-        //    Use event block time for timestamp
         const block = await provider.getBlock(event.log.blockNumber);
-        // For leaderboard XP, we count the winner’s own stake (entry xpAmount) if available; otherwise 0
-        const xpForLb = winnerSnap ? winnerSnap.xpAmount : 0n;
 
         await handleWinner({
           gameType: "pool",
           winner,
           reward: rewardAmount,
-          xpAmount: xpForLb,
+          xpAmount: 0n, // unknown here → default to 0 to avoid NaN
           timestamp: block.timestamp,
         });
 
@@ -318,31 +397,29 @@ function initWeb3Listeners() {
       }
     });
 
-    // PayoutClaimed(bytes32 poolId, address winner, uint256 amount)
-    wavePool.on("PayoutClaimed", async (poolId, winnerAddr, amount, event) => {
+    wavePool.on("PayoutClaimed", async (poolId, winner, amount, event) => {
       try {
+        const block = await provider.getBlock(event.log.blockNumber);
         await broadcastLiveHistory({
           type: "payout_claimed",
           data: {
             gameType: "pool",
             poolId: String(poolId),
-            winner: normalizeAddr(winnerAddr),
+            winner: normalizeAddr(winner),
             amount: toStrBig(amount),
-            timestamp: (await provider.getBlock(event.log.blockNumber)).timestamp,
+            timestamp: block.timestamp,
           },
         });
+        scheduleRecomputeAndBroadcast();
       } catch (err) {
         console.error("❌ PayoutClaimed handler error:", err);
       }
     });
-
-    // (Optional) You can listen to PlayStarted / PoolDrawRequested / RequestFulfilled similarly and broadcast to UI.
   }
 
-  // Initial attach
+  // attach + reconnect
   attach();
 
-  // Reconnect logic
   provider._websocket?.on("error", (err) => {
     console.error("WS provider error:", err?.message || err);
   });

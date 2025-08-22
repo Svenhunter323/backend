@@ -25,6 +25,10 @@ const BetSchema = new mongoose.Schema({
     required: true,
     index: true // speeds up lookup
   },
+  poolType : {
+    type: Boolean,
+    default: null,
+  },
   amount: {
     type: Number,
     required: true

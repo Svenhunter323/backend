@@ -130,7 +130,7 @@ module.exports = (io) => {
       // Only include complete matches (has both winner and loser)
       const results = Object.values(grouped).filter(entry => entry.winner && entry.loser);
 
-      console.log("Game history results:", results, "entries");
+      // console.log("Game history results:", results, "entries");
 
       // Note: total pages should reflect only the filtered challenges
       const totalComplete = await Bet.aggregate([

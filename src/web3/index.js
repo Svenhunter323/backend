@@ -116,7 +116,8 @@ function initWeb3Listeners() {
     }
 
     // Safe winner handler (no NaN increments)
-    async function handleWinner({ gameType, winner, reward, xpAmount, timestamp }) {
+    async function handleWinner({ gameType, winner, reward, xpAmount, timestamp, poolType }) {
+      console.log("handleWinner", gameType, winner, reward, xpAmount, timestamp, poolType);
       // ensure defined
       const incReward = toIncNumber(reward);
       const incXP = toIncNumber(xpAmount);
@@ -129,21 +130,23 @@ function initWeb3Listeners() {
         reward: toStrBig(reward),
         xpAmount: toStrBig(xpAmount),
         timestamp: Number(timestamp),
+        poolType,
       });
+
+      console.log(`✅ Winner handled: ${winner}`, poolType, gameType);
 
       // leaderboard increments (never NaN)
       try {
-        await Leaderboard.findOneAndUpdate(
-          { address: winner },
+        const updated = await Leaderboard.findOneAndUpdate(
+          { address: winner, gameType, poolType },
           {
-            $inc: {
-              wins: 1,
-              totalReward: incReward,
-              totalXP: incXP,
-            },
+            $inc: { wins: 1, totalReward: incReward, totalXP: incXP },
+            $setOnInsert: { address: winner, gameType, poolType },
           },
-          { upsert: true }
+          { upsert: true, new: true, setDefaultsOnInsert: true }
         );
+      
+        // console.log("✅ Leaderboard updated:", updated);
       } catch (e) {
         console.error("❌ Leaderboard increment failed (guarded):", e?.message || e);
       }
@@ -155,6 +158,7 @@ function initWeb3Listeners() {
         reward: toStrBig(reward),
         xpAmount: toStrBig(xpAmount),
         timestamp: Number(timestamp),
+        poolType,
       });
 
       // also emit a settled row to Bets feed
@@ -165,6 +169,7 @@ function initWeb3Listeners() {
         reward: toStrBig(reward),
         result: true,
         timestamp,
+        poolType
       });
 
       // analytics recompute (debounced)
@@ -295,6 +300,7 @@ function initWeb3Listeners() {
               ? wager
               : 0n,
             timestamp: time, // on-chain timestamp
+            poolType: null,
           });
 
           console.log(`✅ Challenge WinnerDrawn handled: ${winnerAddr}`);
@@ -342,7 +348,7 @@ function initWeb3Listeners() {
           result: null,
           payout: "0",
           txHash: event?.log?.transactionHash || null,
-          role: "entrant",
+          role: "challenger",
           challengeId: poolIdStr,
         });
 
@@ -365,6 +371,7 @@ function initWeb3Listeners() {
 
     wavePool.on("WinnerDrawn", async (poolId, winnerAddr, rewardAmount, poolType, event) => {
       const poolIdStr = String(poolId);
+      // console.log("WinnerDrawn", poolIdStr, winnerAddr, rewardAmount, poolType, event);
       const winner = normalizeAddr(winnerAddr);
       try {
         await User.findOneAndUpdate(
@@ -373,11 +380,12 @@ function initWeb3Listeners() {
           { upsert: true, new: true }
         );
 
-        // pessimistic: mark all as lost; (optional) later match exact winning entry
+        // Mark all bets as lost, and set poolType correctly; update winner bet as win
         const bets = await Bet.find({ challengeId: poolIdStr });
         for (const bet of bets) {
-          bet.result = false;
-          bet.payout = "0";
+          bet.result = normalizeAddr(bet.username) === winner;
+          bet.payout = bet.result ? toStrBig(rewardAmount) : "0";
+          bet.poolType = !!poolType;
         }
         await Promise.all(bets.map((b) => b.save()));
 
@@ -389,15 +397,16 @@ function initWeb3Listeners() {
           reward: rewardAmount,
           xpAmount: 0n, // unknown here → default to 0 to avoid NaN
           timestamp: block.timestamp,
+          poolType: !!poolType,
         });
 
-        console.log(`✅ Pool WinnerDrawn handled: ${winner}`);
+        // console.log(`✅ Pool WinnerDrawn handled: ${winner}`);
       } catch (err) {
         console.error("❌ Pool WinnerDrawn error:", err);
       }
     });
 
-    wavePool.on("PayoutClaimed", async (poolId, winner, amount, event) => {
+    wavePool.on("PayoutClaimed", async (poolId, winner, amount, poolType, event) => {
       try {
         const block = await provider.getBlock(event.log.blockNumber);
         await broadcastLiveHistory({
@@ -408,6 +417,7 @@ function initWeb3Listeners() {
             winner: normalizeAddr(winner),
             amount: toStrBig(amount),
             timestamp: block.timestamp,
+            poolType: !!poolType,
           },
         });
         scheduleRecomputeAndBroadcast();

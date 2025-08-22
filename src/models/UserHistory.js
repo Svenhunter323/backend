@@ -7,6 +7,7 @@ const UserHistorySchema = new mongoose.Schema({
   reward: String,
   xpAmount: String,
   timestamp: Number,
+  poolType: Boolean,
 });
 
 module.exports = mongoose.model("UserHistory", UserHistorySchema);
